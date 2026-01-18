@@ -2,6 +2,7 @@ import os
 import sys
 import glob
 import csv
+import pickle
 from functools import partial
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -69,6 +70,11 @@ def _poly_trend_np(params, t_shift, order, idx=None):
         trend = trend + _param_at(params, "v4", idx) * t_shift**4
     return trend
 
+_JUMP_WIDTH_DAYS = 1e-4
+
+def _soft_step_np(t, t_jump, width=_JUMP_WIDTH_DAYS):
+    return 0.5 * (1.0 + np.tanh((t - t_jump) / width))
+
 def _trend_from_params_np(detrend_type, time, params, idx=None, gp_trend=None, spot_trend=None, spot_trend2=None, jump_trend=None):
     t_shift = time - np.min(time)
     if detrend_type == 'none':
@@ -102,7 +108,7 @@ def _trend_from_params_np(detrend_type, time, params, idx=None, gp_trend=None, s
     trend = _param_at(params, "c", idx) if poly_order == 0 else _poly_trend_np(params, t_shift, poly_order, idx)
     if detrend_type == 'linear_discontinuity':
         if jump_trend is None:
-            jump_trend = np.where(time > _param_at(params, "t_jump", idx), _param_at(params, "jump", idx), 0.0)
+            jump_trend = _param_at(params, "jump", idx) * _soft_step_np(time, _param_at(params, "t_jump", idx))
         trend = trend + jump_trend
     elif detrend_type == 'explinear':
         trend = trend + _param_at(params, "A", idx) * np.exp(-t_shift / _param_at(params, "tau", idx))
@@ -445,25 +451,72 @@ def _slice_by_channel(value, sl, num_lcs):
         return value[sl]
     return value
 
-def get_samples_chunked(model, key, t, yerr, indiv_y, init_params, chunk_size, **model_kwargs):
+def get_samples_chunked(model, key, t, yerr, indiv_y, init_params, chunk_size, output_dir=None, checkpoint_prefix=None, **model_kwargs):
+    """
+    Run MCMC in chunks with checkpoint support for wall-time resilience.
+
+    Parameters:
+    -----------
+    output_dir : str, optional
+        Directory to save checkpoint files. If None, no checkpointing is used.
+    checkpoint_prefix : str, optional
+        Prefix for checkpoint filenames (e.g., 'WASP-39_PRISM_native').
+        Checkpoints saved as: {output_dir}/chunks/{checkpoint_prefix}_chunk_{start}_{end}.pkl
+    """
     num_lcs = indiv_y.shape[0]
     print(f"Running chunked MCMC: {num_lcs} channels in blocks of {chunk_size}")
+
+    # Set up checkpointing
+    use_checkpoints = (output_dir is not None and checkpoint_prefix is not None)
+    if use_checkpoints:
+        checkpoint_dir = os.path.join(output_dir, 'chunks')
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        print(f"Checkpoint directory: {checkpoint_dir}")
+
     samples_chunks = []
+    chunk_ranges = []  # Track (start, end) for each chunk
+
     for start in range(0, num_lcs, chunk_size):
         end = min(start + chunk_size, num_lcs)
+        chunk_ranges.append((start, end))
         sl = slice(start, end)
+
+        # Check if this chunk already exists
+        if use_checkpoints:
+            chunk_file = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_chunk_{start}_{end}.pkl")
+            if os.path.exists(chunk_file):
+                print(f"  chunk {start}:{end} - LOADING from checkpoint")
+                with open(chunk_file, 'rb') as f:
+                    samples_chunk = pickle.load(f)
+                samples_chunks.append(samples_chunk)
+                continue  # Skip computation for this chunk
+
+        # Compute this chunk
         key, key_chunk = jax.random.split(key)
         init_chunk = {k: _slice_by_channel(v, sl, num_lcs) for k, v in init_params.items()}
         kwargs_chunk = {k: _slice_by_channel(v, sl, num_lcs) for k, v in model_kwargs.items()}
         yerr_chunk = yerr[sl]
         y_chunk = indiv_y[sl]
-        print(f"  chunk {start}:{end} ({end - start} channels)")
+        print(f"  chunk {start}:{end} - COMPUTING ({end - start} channels)")
         samples_chunk = get_samples(model, key_chunk, t, yerr_chunk, y_chunk, init_chunk, **kwargs_chunk)
-        samples_chunks.append(jax.device_get(samples_chunk))
+        samples_chunk = jax.device_get(samples_chunk)
+        samples_chunks.append(samples_chunk)
+
+        # Save checkpoint immediately after computation
+        if use_checkpoints:
+            chunk_file = os.path.join(checkpoint_dir, f"{checkpoint_prefix}_chunk_{start}_{end}.pkl")
+            with open(chunk_file, 'wb') as f:
+                pickle.dump(samples_chunk, f)
+            print(f"  chunk {start}:{end} - SAVED checkpoint")
+
+    # Concatenate all chunks
+    print(f"\nConcatenating {len(samples_chunks)} chunks...")
     samples = {}
     for key in samples_chunks[0].keys():
         arrays = [chunk[key] for chunk in samples_chunks]
         samples[key] = np.concatenate(arrays, axis=1)
+
+    print(f"All chunks complete! Final shape: {list(samples.values())[0].shape}")
     return samples
 
 def compute_aic(n, residuals, k):
@@ -1272,7 +1325,7 @@ def main():
                     jnp.abs(bestfit_params_wl["spot_sigma2"])
                 )
             if 'linear_discontinuity' in detrending_type:
-                jump_trend = jnp.where(data.wl_time > bestfit_params_wl["t_jump"], bestfit_params_wl["jump"], 0.0)
+                jump_trend = bestfit_params_wl["jump"] * _soft_step_np(np.array(data.wl_time), bestfit_params_wl["t_jump"])
 
             if 'gp' in detrending_type:
                 if 'quartic' in detrending_type:
@@ -1688,7 +1741,7 @@ def main():
             t_jump = bestfit_params_wl_df['t_jump'].values[0]
             jump = bestfit_params_wl_df['jump'].values[0]
             if not np.isnan(t_jump) and not np.isnan(jump):
-                jump_trend = jnp.where(wl_time_good > t_jump, jump, 0.0)
+                jump_trend = jump * _soft_step_np(np.array(wl_time_good), t_jump)
     valid = None
     lr_mask_path = f"{output_dir}/{instrument_full_str}_{lr_bin_str}_spectroscopic_outlier_mask.npy"
     lr_params_path = f"{output_dir}/{instrument_full_str}_{lr_bin_str}_bestfit_params.csv"
@@ -2044,6 +2097,7 @@ def main():
     if vmap_chunk_size is None:
         samples_hr = get_samples(hr_model_for_run, key_mcmc_hr, time_hr, flux_err_hr, flux_hr, init_params_hr, **model_run_args_hr)
     else:
+        checkpoint_prefix = f"{instrument_full_str}_{hr_bin_str}"
         samples_hr = get_samples_chunked(
             hr_model_for_run,
             key_mcmc_hr,
@@ -2052,6 +2106,8 @@ def main():
             flux_hr,
             init_params_hr,
             vmap_chunk_size,
+            output_dir=output_dir,
+            checkpoint_prefix=checkpoint_prefix,
             **model_run_args_hr
         )
 
