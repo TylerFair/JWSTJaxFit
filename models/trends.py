@@ -4,6 +4,11 @@ from .core import compute_transit_model
 def _trend_time(t):
     return t - jnp.min(t)
 
+_JUMP_WIDTH_DAYS = 1e-4
+
+def _soft_step(t, t_jump, width=_JUMP_WIDTH_DAYS):
+    return 0.5 * (1.0 + jnp.tanh((t - t_jump) / width))
+
 def _poly_trend(params, t_norm, order):
     trend = params["c"] + params["v"] * t_norm
     if order >= 2:
@@ -48,7 +53,7 @@ def compute_lc_quartic(params, t):
 def compute_lc_linear_discontinuity(params, t):
     t_norm = _trend_time(t)
     lc_transit = compute_transit_model(params, t)
-    jump = jnp.where(t > params["t_jump"], params["jump"], 0.0)
+    jump = params["jump"] * _soft_step(t, params["t_jump"])
     trend = _poly_trend(params, t_norm, order=1) + jump
     return lc_transit + trend
 
