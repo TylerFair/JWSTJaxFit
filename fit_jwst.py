@@ -1538,9 +1538,8 @@ def main():
 
             wl_time_vector = np.array(data.time[spec_good_mask])
             wl_model_vector = np.array(compute_transit_model(bestfit_params_wl, jnp.array(wl_time_vector)) + 1.0)
-            time_center = np.median(wl_time_vector)
-
-            res_zoom_factor = 2.0 
+            time_center = float(bestfit_params_wl['t0'][0])
+            res_zoom_factor = 1.0 
 
             for idx_i, bin_idx in enumerate(hr_indices):
                 raw_flux_hr = data.flux_hr[bin_idx]
