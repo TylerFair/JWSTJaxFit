@@ -65,8 +65,11 @@ def create_whitelight_model(detrend_type='linear', n_planets=1, ld_profile='quad
             t0s.append(numpyro.sample(f"t0_{i}", dist.Uniform(jnp.min(t), jnp.max(t))))
             _b = numpyro.sample(f"_b_{i}", dist.Uniform(-2.0, 2.0))
             bs.append(numpyro.deterministic(f'b_{i}', jnp.abs(_b)))
-            depths = numpyro.sample(f'depths_{i}', dist.Uniform(1e-6, 0.5))
-            rorss.append(numpyro.deterministic(f"rors_{i}", jnp.sqrt(depths)))
+            #depths = numpyro.sample(f'depths_{i}', dist.Uniform(1e-6, 0.5))
+            #rorss.append(numpyro.deterministic(f"rors_{i}", jnp.sqrt(depths)))
+            _rors = numpyro.sample(f"rors_{i}", dist.Uniform(1e-3, 0.7))
+            rorss.append(_rors)
+            _ = numpyro.deterministic(f'depths_{i}', jnp.square(_rors))
 
         if ld_profile == 'quadratic':
             u = numpyro.sample("u", dist.Uniform(0.0, 1.0).expand([2]).to_event(1))
@@ -179,9 +182,12 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
         t0s = mu_t0
         bs = mu_b
 
-        depths = numpyro.sample('depths', dist.Uniform(1e-5, 0.5).expand([num_lcs, n_planets]))
-        rors = numpyro.deterministic("rors", jnp.sqrt(depths))
+        #depths = numpyro.sample('depths', dist.Uniform(1e-5, 0.5).expand([num_lcs, n_planets]))
+        #rors = numpyro.deterministic("rors", jnp.sqrt(depths))
+        rors = numpyro.sample('rors', dist.Uniform(1e-3, 0.7).expand([num_lcs, n_planets]))
+        depths = numpyro.deterministic('depths', jnp.square(rors))
 
+                               
         yerr_per_lc = jnp.nanmedian(yerr, axis=1)
         log_jitter = numpyro.sample('log_jitter', dist.Uniform(jnp.log(1e-6), jnp.log(1)).expand([num_lcs]))
         jitter = jnp.exp(log_jitter)
