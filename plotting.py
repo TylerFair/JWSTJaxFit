@@ -329,7 +329,9 @@ def plot_wavelength_offset_summary(
                 trend = c_i + map_params['A_spot'][idx] * spot_trend
             
             elif detrend_type == 'linear_discontinuity_spectroscopic':
-                trend = c_i + map_params['A_jump'][idx] * jump_trend
+                v_i = map_params.get('v', [0.0]*num_lcs)[idx]
+                t_shift = t - np.min(t)
+                trend = c_i + v_i * t_shift + map_params['A_jump'][idx] * jump_trend
 
             else:
                 v_i = map_params.get('v', [0.0]*num_lcs)[idx]
