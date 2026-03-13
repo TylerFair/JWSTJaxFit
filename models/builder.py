@@ -9,7 +9,10 @@ from .trends import (
     compute_lc_linear, compute_lc_quadratic, compute_lc_cubic, compute_lc_quartic,
     compute_lc_linear_discontinuity, compute_lc_explinear, compute_lc_spot, compute_lc_2spot,
     compute_lc_none, compute_lc_spot_spectroscopic, compute_lc_2spot_spectroscopic,
-    compute_lc_linear_discontinuity_spectroscopic
+    compute_lc_linear_discontinuity_spectroscopic, compute_lc_spot_linear_discontinuity,
+    compute_lc_spot_explinear, compute_lc_2spot_explinear,
+    compute_lc_spot_linear_discontinuity_spectroscopic, compute_lc_spot_explinear_spectroscopic,
+    compute_lc_2spot_explinear_spectroscopic
 )
 from .gp import (
     compute_lc_gp_mean, compute_lc_linear_gp_mean, compute_lc_quadratic_gp_mean,
@@ -41,7 +44,33 @@ COMPUTE_KERNELS = {
     'spot_spectroscopic': compute_lc_spot_spectroscopic,
     '2spot_spectroscopic': compute_lc_2spot_spectroscopic,
     'linear_discontinuity_spectroscopic': compute_lc_linear_discontinuity_spectroscopic,
+    'spot+linear_discontinuity': compute_lc_spot_linear_discontinuity,
+    'spot+explinear': compute_lc_spot_explinear,
+    '2spot+explinear': compute_lc_2spot_explinear,
+    'spot_spectroscopic+linear_discontinuity_spectroscopic': compute_lc_spot_linear_discontinuity_spectroscopic,
+    'spot_spectroscopic+explinear': compute_lc_spot_explinear_spectroscopic,
+    '2spot_spectroscopic+explinear': compute_lc_2spot_explinear_spectroscopic,
 }
+
+COMPOSITE_KERNELS = {
+    frozenset({'spot', 'linear_discontinuity'}): compute_lc_spot_linear_discontinuity,
+    frozenset({'spot', 'explinear'}): compute_lc_spot_explinear,
+    frozenset({'2spot', 'explinear'}): compute_lc_2spot_explinear,
+    frozenset({'spot_spectroscopic', 'linear_discontinuity_spectroscopic'}): compute_lc_spot_linear_discontinuity_spectroscopic,
+    frozenset({'spot_spectroscopic', 'explinear'}): compute_lc_spot_explinear_spectroscopic,
+    frozenset({'2spot_spectroscopic', 'explinear'}): compute_lc_2spot_explinear_spectroscopic,
+}
+
+def _split_components(detrend_type):
+    return set(detrend_type.split('+'))
+
+def resolve_detrend_kernel(detrend_type):
+    if detrend_type in COMPUTE_KERNELS:
+        return COMPUTE_KERNELS[detrend_type]
+    detrend_components = frozenset(_split_components(detrend_type))
+    if detrend_components in COMPOSITE_KERNELS:
+        return COMPOSITE_KERNELS[detrend_components]
+    raise KeyError(detrend_type)
 
 def _prepare_power2_poly(degree=12, n_mu=300):
     mus = jnp.linspace(0.0, 1.0, n_mu, endpoint=True)
@@ -52,7 +81,7 @@ def _prepare_power2_poly(degree=12, n_mu=300):
 def create_whitelight_model(detrend_type='linear', n_planets=1, ld_profile='quadratic'):
     print(f"Building whitelight model with: detrend_type='{detrend_type}' for {n_planets} planets")
 
-    detrend_components = set(detrend_type.split('+'))
+    detrend_components = _split_components(detrend_type)
     if ld_profile == "power2":
         MUS, P = _prepare_power2_poly()
 
@@ -65,11 +94,8 @@ def create_whitelight_model(detrend_type='linear', n_planets=1, ld_profile='quad
             t0s.append(numpyro.sample(f"t0_{i}", dist.Uniform(jnp.min(t), jnp.max(t))))
             _b = numpyro.sample(f"_b_{i}", dist.Uniform(-2.0, 2.0))
             bs.append(numpyro.deterministic(f'b_{i}', jnp.abs(_b)))
-            #depths = numpyro.sample(f'depths_{i}', dist.Uniform(1e-6, 0.5))
-            #rorss.append(numpyro.deterministic(f"rors_{i}", jnp.sqrt(depths)))
-            _rors = numpyro.sample(f"rors_{i}", dist.Uniform(1e-3, 0.7))
-            rorss.append(_rors)
-            _ = numpyro.deterministic(f'depths_{i}', jnp.square(_rors))
+            depths = numpyro.sample(f'depths_{i}', dist.Uniform(1e-6, 0.5))
+            rorss.append(numpyro.deterministic(f"rors_{i}", jnp.sqrt(depths)))
 
         if ld_profile == 'quadratic':
             u = numpyro.sample("u", dist.Uniform(0.0, 1.0).expand([2]).to_event(1))
@@ -151,23 +177,24 @@ def create_whitelight_model(detrend_type='linear', n_planets=1, ld_profile='quad
             gp = gp_builder(params, t, error)
             numpyro.sample('obs', gp.numpyro_dist(), obs=y)
         else:
-            if detrend_type in COMPUTE_KERNELS:
-                lc_model = COMPUTE_KERNELS[detrend_type](params, t)
+            try:
+                lc_model = resolve_detrend_kernel(detrend_type)(params, t)
                 numpyro.sample('obs', dist.Normal(lc_model, error), obs=y)
-            else:
-                 raise ValueError(f"Unknown detrend_type: {detrend_type}")
+            except KeyError:
+                raise ValueError(f"Unknown detrend_type: {detrend_type}")
 
     return _whitelight_model_static
 
 def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='free', n_planets=1, ld_profile='quadratic'):
     print(f"Building vectorized model with: detrend='{detrend_type}', ld='{ld_mode}', trend='{trend_mode}' for {n_planets} planets")
 
-    if detrend_type not in COMPUTE_KERNELS:
+    detrend_components = _split_components(detrend_type)
+    try:
+        compute_lc_kernel = resolve_detrend_kernel(detrend_type)
+    except KeyError:
         raise ValueError(f"Unsupported detrend_type for vectorized model: {detrend_type}")
-    if detrend_type in {"spot", "2spot", "linear_discontinuity"}:
+    if detrend_components in ({"spot"}, {"2spot"}, {"linear_discontinuity"}):
         raise ValueError(f"Vectorized model does not support '{detrend_type}'. Use '{detrend_type}_spectroscopic' instead.")
-
-    compute_lc_kernel = COMPUTE_KERNELS[detrend_type]
     if ld_profile == "power2":
         MUS_LD, P_LD = _prepare_power2_poly()
 
@@ -182,12 +209,9 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
         t0s = mu_t0
         bs = mu_b
 
-        #depths = numpyro.sample('depths', dist.Uniform(1e-5, 0.5).expand([num_lcs, n_planets]))
-        #rors = numpyro.deterministic("rors", jnp.sqrt(depths))
-        rors = numpyro.sample('rors', dist.Uniform(1e-3, 0.7).expand([num_lcs, n_planets]))
-        depths = numpyro.deterministic('depths', jnp.square(rors))
+        depths = numpyro.sample('depths', dist.Uniform(1e-5, 0.5).expand([num_lcs, n_planets]))
+        rors = numpyro.deterministic("rors", jnp.sqrt(depths))
 
-                               
         yerr_per_lc = jnp.nanmedian(yerr, axis=1)
         log_jitter = numpyro.sample('log_jitter', dist.Uniform(jnp.log(1e-6), jnp.log(1)).expand([num_lcs]))
         jitter = jnp.exp(log_jitter)
@@ -218,7 +242,6 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
         params = {
             "period": PERIOD, "duration": durations, "t0": t0s, "b": bs, "rors": rors, "u": u,
         }
-
         in_axes = {"period": None, "duration": None, "t0": None, "b": None, "rors": 0, "u": 0}
 
         if detrend_type != 'none':
@@ -246,7 +269,7 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
                     in_axes.update({'v4': 0})
 
 
-                if detrend_type == 'explinear':
+                if 'explinear' in detrend_components:
                     params['A'] = numpyro.sample('A', dist.Uniform(-0.1, 0.1).expand([num_lcs]))
                     log_tau = numpyro.sample('log_tau', dist.Uniform(jnp.log(1e-3), jnp.log(1e-1)).expand([num_lcs]))
                     params['tau'] = numpyro.deterministic('tau', jnp.exp(log_tau))
@@ -275,15 +298,15 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
                 if poly_order >= 4:
                     params['v4'] = numpyro.deterministic('v4', trend_temp[:, 4])
                     in_axes.update({'v4': 0})
-                if detrend_type == 'linear_discontinuity':
+                if 'linear_discontinuity' in detrend_components:
                     params['t_jump'] = numpyro.deterministic('t_jump', trend_temp[:, 2])
                     params['jump'] = numpyro.deterministic('jump', trend_temp[:, 3])
                     in_axes.update({'t_jump': 0, 'jump': 0})
-                elif detrend_type == 'explinear':
+                elif 'explinear' in detrend_components:
                     params['A'] = numpyro.deterministic('A', trend_temp[:, 2])
                     params['tau'] = numpyro.deterministic('tau', trend_temp[:, 3])
                     in_axes.update({'A': 0, 'tau': 0})
-                elif detrend_type == 'spot':
+                elif 'spot' in detrend_components and '2spot' not in detrend_components:
                     params['spot_amp'] = numpyro.deterministic('spot_amp', trend_temp[:, 2])
                     params['spot_mu'] = numpyro.deterministic('spot_mu', trend_temp[:, 3])
                     params['spot_sigma'] = numpyro.deterministic('spot_sigma', trend_temp[:, 4])
@@ -291,20 +314,20 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
             else:
                 raise ValueError(f"Unknown trend_mode: {trend_mode}")
 
-        if 'gp_spectroscopic' in detrend_type:
+        if 'gp_spectroscopic' in detrend_components:
             params['A_gp'] = numpyro.sample('A_gp', dist.Uniform(0.5, 2).expand([num_lcs]))
             in_axes['A_gp'] = 0
 
-            if 'linear' in detrend_type and 'v' not in params:
+            if 'linear' in detrend_components and 'v' not in params:
                 params['v'] = numpyro.sample('v', dist.Uniform(-0.1, 0.1).expand([num_lcs]))
                 in_axes['v'] = 0
 
             poly_order = 1
-            if 'quartic' in detrend_type:
+            if 'quartic' in detrend_components:
                 poly_order = 4
-            elif 'cubic' in detrend_type:
+            elif 'cubic' in detrend_components:
                 poly_order = 3
-            elif 'quadratic' in detrend_type:
+            elif 'quadratic' in detrend_components:
                 poly_order = 2
 
             if poly_order >= 2 and 'v2' not in params:
@@ -317,7 +340,7 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
                 params['v4'] = numpyro.sample('v4', dist.Uniform(-0.1, 0.1).expand([num_lcs]))
                 in_axes['v4'] = 0
 
-            if 'explinear' in detrend_type and 'A' not in params:
+            if 'explinear' in detrend_components and 'A' not in params:
                 params['A'] = numpyro.sample('A', dist.Uniform(-0.1, 0.1).expand([num_lcs]))
                 log_tau = numpyro.sample('log_tau', dist.Uniform(jnp.log(1e-3), jnp.log(1e-1)).expand([num_lcs]))
                 params['tau'] = numpyro.deterministic('tau', jnp.exp(log_tau))
@@ -325,17 +348,22 @@ def create_vectorized_model(detrend_type='linear', ld_mode='free', trend_mode='f
 
             y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None))(params, t, gp_trend)
 
-        elif detrend_type == 'spot_spectroscopic':
-            params['A_spot'] = numpyro.sample('A_spot', dist.Uniform(0.5, 2).expand([num_lcs]))
-            in_axes['A_spot'] = 0
-            y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None))(params, t, spot_trend)
-        elif detrend_type == '2spot_spectroscopic':
+        elif '2spot_spectroscopic' in detrend_components:
             params['A_spot'] = numpyro.sample('A_spot', dist.Uniform(0.5, 2).expand([num_lcs]))
             params['A_spot2'] = numpyro.sample('A_spot2', dist.Uniform(0.5, 2).expand([num_lcs]))
             in_axes['A_spot'] = 0
             in_axes['A_spot2'] = 0
             y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None, None))(params, t, spot_trend, spot_trend2)
-        elif detrend_type == 'linear_discontinuity_spectroscopic':
+        elif 'spot_spectroscopic' in detrend_components:
+            params['A_spot'] = numpyro.sample('A_spot', dist.Uniform(0.5, 2).expand([num_lcs]))
+            in_axes['A_spot'] = 0
+            if 'linear_discontinuity_spectroscopic' in detrend_components:
+                params['A_jump'] = numpyro.sample('A_jump', dist.Uniform(0.5, 2).expand([num_lcs]))
+                in_axes['A_jump'] = 0
+                y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None, None))(params, t, spot_trend, jump_trend)
+            else:
+                y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None))(params, t, spot_trend)
+        elif 'linear_discontinuity_spectroscopic' in detrend_components:
             params['A_jump'] = numpyro.sample('A_jump', dist.Uniform(0.5, 2).expand([num_lcs]))
             in_axes['A_jump'] = 0
             y_model = jax.vmap(compute_lc_kernel, in_axes=(in_axes, None, None))(params, t, jump_trend)
